@@ -1,0 +1,418 @@
+name: Carry camera zoom
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run the carry and tests, then skip every push
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: carry-camera-zoom
+  cancel-in-progress: false
+
+jobs:
+  carry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Sync main and carry zoom
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' }}
+          UPSTREAM_URL: https://github.com/pollen-robotics/reachy_mini.git
+          ZOOM_BRANCH: reachy-bot/zoom
+          STAMP_SUBJECT: Stamp zoom package version
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_REPOSITORY:-}" != "jdvmi00/reachy_mini" ]; then
+            echo "Refusing to run outside jdvmi00/reachy_mini (got '${GITHUB_REPOSITORY:-}')."
+            exit 1
+          fi
+
+          origin_url="$(git remote get-url origin)"
+          case "$origin_url" in
+            *github.com/pollen-robotics/reachy_mini*|*github.com:pollen-robotics/reachy_mini*)
+              echo "Refusing to run: origin is pollen-robotics/reachy_mini."
+              exit 1
+              ;;
+          esac
+
+          mkdir -p /tmp/empty-git-hooks
+          git config user.name "Jim Martin"
+          git config user.email "jimmartin@gmail.com"
+          git config core.hooksPath /tmp/empty-git-hooks
+          export GIT_AUTHOR_NAME="Jim Martin"
+          export GIT_AUTHOR_EMAIL="jimmartin@gmail.com"
+          export GIT_COMMITTER_NAME="Jim Martin"
+          export GIT_COMMITTER_EMAIL="jimmartin@gmail.com"
+          export GIT_EDITOR=true
+          export GIT_TERMINAL_PROMPT=0
+
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git remote set-url --push upstream DISABLED
+
+          echo "Fetching upstream and origin"
+          git fetch upstream --prune --tags
+          git fetch origin --tags
+          git fetch origin "+refs/heads/${ZOOM_BRANCH}:refs/remotes/origin/${ZOOM_BRANCH}" || true
+
+          job_failed=0
+
+          latest_stable_tag() {
+            local merged="${1:-}"
+            local tag
+            if [ -n "$merged" ]; then
+              git tag -l 'v*' --merged "$merged" --sort=-v:refname > /tmp/stable-tags.txt
+            else
+              git tag -l 'v*' --sort=-v:refname > /tmp/stable-tags.txt
+            fi
+            while IFS= read -r tag; do
+              if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                printf '%s\n' "$tag"
+                return 0
+              fi
+            done < /tmp/stable-tags.txt
+            return 1
+          }
+
+          issue_upsert() {
+            local title="$1"
+            local body_file="$2"
+            local num
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "Dry run: would open or update issue: $title"
+              cat "$body_file"
+              return 0
+            fi
+            num="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --json number,title \
+              --jq "[.[] | select(.title == \"$title\")][0].number // empty")"
+            if [ -z "$num" ]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body_file"
+            else
+              gh issue comment --repo "$GITHUB_REPOSITORY" "$num" --body-file "$body_file"
+            fi
+          }
+
+          close_issue() {
+            local title="$1"
+            local comment="$2"
+            local num
+            if [ "$DRY_RUN" = "true" ]; then
+              return 0
+            fi
+            num="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --json number,title \
+              --jq "[.[] | select(.title == \"$title\")][0].number // empty" || true)"
+            if [ -n "$num" ]; then
+              gh issue close --repo "$GITHUB_REPOSITORY" "$num" --comment "$comment" || true
+            fi
+          }
+
+          write_issue() {
+            local title="$1"
+            local heading="$2"
+            local detail_file="$3"
+            local body
+            body="/tmp/issue-body.md"
+            {
+              echo "$heading"
+              echo
+              echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+              echo
+              echo "No zoom tag was published for this failure."
+              echo
+              tail -c 20000 "$detail_file"
+            } > "$body"
+            cp "$body" /tmp/issue-body-truncated.md
+            echo
+            echo "FAILURE: $title"
+            cat /tmp/issue-body-truncated.md
+            if ! issue_upsert "$title" /tmp/issue-body-truncated.md; then
+              echo "Could not open a GitHub issue. Issues are disabled on forks until Settings → General → Features → Issues is turned on."
+            fi
+          }
+
+          sync_main() {
+            echo "Syncing fork main from upstream/main"
+            git checkout -B main origin/main
+            if git merge-base --is-ancestor upstream/main HEAD; then
+              echo "Fork main already contains upstream/main"
+              close_issue "Fork main sync failed" "upstream/main is already contained in fork main."
+              return 0
+            fi
+            if git merge --no-edit -m "Merge upstream main into fork main" upstream/main; then
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "Dry run: would push main"
+              elif ! git push origin HEAD:main; then
+                echo "Push of main was rejected." > /tmp/main-sync-detail.md
+                write_issue "Fork main sync failed" "Could not push the upstream merge to fork main." /tmp/main-sync-detail.md
+                return 1
+              fi
+              close_issue "Fork main sync failed" "Merged upstream/main into fork main."
+              return 0
+            fi
+            {
+              echo "Merging upstream/main into fork main conflicted."
+              echo
+              echo "Conflicted files:"
+              git diff --name-only --diff-filter=U || true
+              echo
+              echo "Resolve FORK.md and .github/workflows/carry-zoom.yml by hand, keep the rest of upstream, and push main. See FORK.md."
+            } > /tmp/main-sync-detail.md
+            git merge --abort || true
+            write_issue "Fork main sync failed" "Fork main could not merge upstream/main." /tmp/main-sync-detail.md
+            return 1
+          }
+
+          stamp_version() {
+            local upstream_ver="$1"
+            python3 - "$upstream_ver" <<'PY'
+          import pathlib, sys
+          upstream = sys.argv[1]
+          local = f"{upstream}+zoom.1"
+          py_path = pathlib.Path("pyproject.toml")
+          lines = py_path.read_text().splitlines(keepends=True)
+          found = False
+          for i, line in enumerate(lines):
+              stripped = line.rstrip("\n")
+              if not stripped.startswith('version = "') or not stripped.endswith('"'):
+                  continue
+              current = stripped[len('version = "'):-1]
+              base = current.split("+", 1)[0]
+              if base != upstream:
+                  sys.exit(f"pyproject version {current} does not match tag {upstream}")
+              nl = "\n" if line.endswith("\n") else ""
+              lines[i] = f'version = "{local}"{nl}'
+              found = True
+              break
+          if not found:
+              sys.exit("pyproject.toml has no version line")
+          py_path.write_text("".join(lines))
+
+          lock_path = pathlib.Path("uv.lock")
+          lines = lock_path.read_text().splitlines(keepends=True)
+          out = []
+          in_block = False
+          done = False
+          for line in lines:
+              if line.startswith("[[package]]"):
+                  in_block = False
+              if line == 'name = "reachy-mini"\n':
+                  in_block = True
+              if in_block and not done and line.startswith("version = "):
+                  out.append(f'version = "{local}"\n')
+                  done = True
+                  in_block = False
+                  continue
+              out.append(line)
+          if not done:
+              sys.exit("uv.lock has no reachy-mini version")
+          lock_path.write_text("".join(out))
+          print(local)
+          PY
+          }
+
+          carry_zoom() {
+            local latest base zoom_tag upstream_ver local_ver
+            local -a shas=()
+            local sha subject rc expected
+
+            if ! git rev-parse --verify --quiet "refs/remotes/origin/${ZOOM_BRANCH}" >/dev/null; then
+              echo "Branch ${ZOOM_BRANCH} is missing; nothing to carry." > /tmp/zoom-detail.md
+              write_issue "Camera zoom carry failed" "reachy-bot/zoom does not exist on origin." /tmp/zoom-detail.md
+              return 1
+            fi
+
+            if ! latest="$(latest_stable_tag)"; then
+              echo "No stable vX.Y.Z tag was found on upstream." > /tmp/zoom-detail.md
+              write_issue "Camera zoom carry failed" "No stable upstream release tag." /tmp/zoom-detail.md
+              return 1
+            fi
+            if ! base="$(latest_stable_tag "refs/remotes/origin/${ZOOM_BRANCH}")"; then
+              echo "No stable release tag is contained in ${ZOOM_BRANCH}." > /tmp/zoom-detail.md
+              write_issue "Camera zoom carry failed for ${ZOOM_BRANCH}" "Could not find the release under the zoom branch." /tmp/zoom-detail.md
+              return 1
+            fi
+
+            zoom_tag="${latest}+zoom.1"
+            upstream_ver="${latest#v}"
+            echo "Latest stable tag ${latest}; zoom branch base ${base}"
+
+            if git rev-parse --verify --quiet "refs/tags/${zoom_tag}" >/dev/null; then
+              echo "Tag ${zoom_tag} already exists. Nothing to carry."
+              close_issue "Camera zoom carry failed for ${latest}" "Tag ${zoom_tag} is already present."
+              return 0
+            fi
+
+            git log --reverse --format='%H%x09%s' "${base}..refs/remotes/origin/${ZOOM_BRANCH}" > /tmp/zoom-log.txt
+            while IFS=$'\t' read -r sha subject; do
+              [ -z "${sha}" ] && continue
+              if [ "$subject" = "$STAMP_SUBJECT" ]; then
+                echo "Skipping stamp commit ${sha}"
+                continue
+              fi
+              shas+=("$sha")
+            done < /tmp/zoom-log.txt
+
+            if [ "${#shas[@]}" -eq 0 ]; then
+              echo "No zoom commits between ${base} and ${ZOOM_BRANCH}." > /tmp/zoom-detail.md
+              write_issue "Camera zoom carry failed for ${latest}" "The zoom branch has no patch commits to carry." /tmp/zoom-detail.md
+              return 1
+            fi
+
+            echo "Patch commits:"
+            printf '  %s\n' "${shas[@]}"
+
+            if [ "$latest" = "$base" ]; then
+              git checkout -B zoom-carry "refs/remotes/origin/${ZOOM_BRANCH}"
+            else
+              git checkout -B zoom-carry "${latest}^{commit}"
+              for sha in "${shas[@]}"; do
+                set +e
+                git cherry-pick "$sha"
+                rc=$?
+                set -e
+                if [ "$rc" -eq 0 ]; then
+                  continue
+                fi
+                if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+                  {
+                    echo "Cherry-pick conflict while carrying onto ${latest}."
+                    echo
+                    echo "Commit:"
+                    git log -1 --format='%H %s' "$sha"
+                    echo
+                    echo "Conflicted files:"
+                    git diff --name-only --diff-filter=U
+                    echo
+                    echo "See FORK.md, section \"Resolve a conflict by hand\"."
+                  } > /tmp/zoom-detail.md
+                  git cherry-pick --abort || true
+                  git reset --hard "${latest}^{commit}"
+                  write_issue "Camera zoom carry failed for ${latest}" "Cherry-pick conflict on ${latest}." /tmp/zoom-detail.md
+                  return 1
+                fi
+                if [ -f .git/CHERRY_PICK_HEAD ]; then
+                  echo "Cherry-pick of ${sha} is empty; skipping"
+                  git cherry-pick --skip
+                  continue
+                fi
+                {
+                  echo "Cherry-pick of ${sha} failed with status ${rc}."
+                  git status || true
+                } > /tmp/zoom-detail.md
+                git cherry-pick --abort || true
+                git reset --hard "${latest}^{commit}"
+                write_issue "Camera zoom carry failed for ${latest}" "Cherry-pick failed on ${latest}." /tmp/zoom-detail.md
+                return 1
+              done
+            fi
+
+            if ! local_ver="$(stamp_version "$upstream_ver" 2>/tmp/stamp-err.txt)"; then
+              {
+                echo "Could not stamp ${upstream_ver}+zoom.1."
+                cat /tmp/stamp-err.txt
+              } > /tmp/zoom-detail.md
+              write_issue "Camera zoom carry failed for ${latest}" "Version stamp failed for ${latest}." /tmp/zoom-detail.md
+              return 1
+            fi
+            echo "Stamped ${local_ver}"
+
+            git add pyproject.toml uv.lock
+            if git diff --cached --quiet; then
+              echo "Version files already match ${local_ver}"
+            else
+              git commit -m "$STAMP_SUBJECT" -m "Report ${local_ver} from this build so it can be told apart from upstream ${upstream_ver}."
+            fi
+
+            if git diff --quiet "${latest}^{commit}" HEAD -- . ':(exclude)pyproject.toml' ':(exclude)uv.lock'; then
+              {
+                echo "Carrying onto ${latest} changed no files other than the package version."
+                echo "Camera zoom may already be in this Pollen release."
+                echo "See FORK.md, section \"Retire this fork\"."
+              } > /tmp/zoom-detail.md
+              write_issue "Camera zoom carry failed for ${latest}" "Zoom patch is empty on ${latest}." /tmp/zoom-detail.md
+              return 1
+            fi
+
+            echo "Running zoom tests, ruff, and mypy"
+            if ! uv lock --check > /tmp/zoom-test.log 2>&1; then
+              write_issue "Camera zoom carry failed for ${latest}" "uv lock --check failed for ${latest}." /tmp/zoom-test.log
+              return 1
+            fi
+            if ! uv sync --frozen --all-extras --group dev > /tmp/zoom-test.log 2>&1; then
+              write_issue "Camera zoom carry failed for ${latest}" "uv sync failed for ${latest}." /tmp/zoom-test.log
+              return 1
+            fi
+            set +e
+            {
+              uv run pytest tests/unit_tests/test_camera_zoom.py -q --tb=short
+              echo "pytest_exit:$?"
+              uv run ruff check
+              echo "ruff_exit:$?"
+              uv run mypy
+              echo "mypy_exit:$?"
+              got="$(uv run python -c 'from importlib.metadata import version; print(version("reachy_mini"))')"
+              echo "version:${got}"
+            } > /tmp/zoom-test.log 2>&1
+            set -e
+            cat /tmp/zoom-test.log
+            if ! grep -qx 'pytest_exit:0' /tmp/zoom-test.log \
+              || ! grep -qx 'ruff_exit:0' /tmp/zoom-test.log \
+              || ! grep -qx 'mypy_exit:0' /tmp/zoom-test.log \
+              || ! grep -qx "version:${local_ver}" /tmp/zoom-test.log; then
+              write_issue "Camera zoom carry failed for ${latest}" "Tests, ruff, or mypy failed for ${latest}." /tmp/zoom-test.log
+              return 1
+            fi
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "Dry run: would publish ${ZOOM_BRANCH} at $(git rev-parse HEAD) and tag ${zoom_tag}"
+              return 0
+            fi
+
+            if [ "$latest" = "$base" ]; then
+              if ! git push origin "HEAD:refs/heads/${ZOOM_BRANCH}"; then
+                echo "Fast-forward push of ${ZOOM_BRANCH} was rejected." > /tmp/zoom-detail.md
+                write_issue "Camera zoom carry failed for ${latest}" "Could not push ${ZOOM_BRANCH}." /tmp/zoom-detail.md
+                return 1
+              fi
+            else
+              expected="$(git rev-parse "refs/remotes/origin/${ZOOM_BRANCH}")"
+              if ! git push --force-with-lease="refs/heads/${ZOOM_BRANCH}:${expected}" origin "HEAD:refs/heads/${ZOOM_BRANCH}"; then
+                echo "Force-with-lease push of ${ZOOM_BRANCH} was rejected. The remote branch moved; rebase the carry onto it and run this workflow again." > /tmp/zoom-detail.md
+                write_issue "Camera zoom carry failed for ${latest}" "Could not push ${ZOOM_BRANCH}." /tmp/zoom-detail.md
+                return 1
+              fi
+            fi
+            if ! git push origin "refs/tags/${zoom_tag}"; then
+              echo "The branch was updated, but pushing tag ${zoom_tag} failed. Re-run the workflow to retry the tag." > /tmp/zoom-detail.md
+              write_issue "Camera zoom carry failed for ${latest}" "Could not push tag ${zoom_tag}." /tmp/zoom-detail.md
+              return 1
+            fi
+            echo "Published ${zoom_tag} at $(git rev-parse HEAD)"
+            close_issue "Camera zoom carry failed for ${latest}" "Published ${zoom_tag}."
+          }
+
+          sync_main || job_failed=1
+          carry_zoom || job_failed=1
+          exit "$job_failed"
