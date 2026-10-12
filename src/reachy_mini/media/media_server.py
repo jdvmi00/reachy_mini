@@ -93,6 +93,18 @@ SESSION_FAILED_REASON_PC_FAILED = "peer_connection_failed"
 IPC_FPS = 10
 
 
+# Buffers (~1.5 s at 30 fps) during which a new zoom crop is re-asserted.
+_ZOOM_REASSERT_BUFFERS = 45
+# Buffers after a window starts at which the zoom is checked from a frame
+# thumbnail. A crop can show up for a frame or two and then revert, so it
+# only counts as applied once it is still visible at the last check (~2 s).
+_ZOOM_CHECK_AT = (8, 16, 30, 46, 60)
+_ZOOM_MAX_ATTEMPTS = 4
+# Native-pixel nudge for retries, so libcamera sees a different crop and
+# re-programs the ISP (it skips crops equal to the one it last set).
+_ZOOM_NUDGE = 8
+
+
 @dataclass
 class _PeerWebRTCState:
     """Live state of a single WebRTC peer's negotiation.
@@ -400,6 +412,17 @@ class GstMediaServer:
         """
         factory = encoder.get_factory()
         factory_name = factory.get_name() if factory else ""
+        klass = (factory.get_metadata("klass") or "") if factory else ""
+        if "Encoder/Video" in klass:
+            # Remembered so a zoom change can ask for a keyframe (see
+            # _request_keyframes).
+            # Strong refs: PyGObject wrappers die with the callback, so a
+            # WeakSet would forget them. Encoders that left the pipeline
+            # (consumer gone) are pruned here and in _request_keyframes.
+            self._video_encoders = [
+                e for e in getattr(self, "_video_encoders", []) if e.get_parent() is not None
+            ] + [encoder]
+            self._logger.info(f"{factory_name} for {consumer_id}: keyframes on zoom")
         if factory_name == "opusenc":
             if encoder.find_property("inband-fec") is not None:
                 encoder.set_property("inband-fec", True)
@@ -953,8 +976,17 @@ class GstMediaServer:
         elements = [camerasrc, capsfilter]
         if not all(elements):
             raise RuntimeError("Failed to create libcamerasrc elements")
+        # Runtime zoom is applied from the camera's streaming thread (see
+        # _zoom_probe), so install a buffer probe right after libcamerasrc.
+        self._zoom_lock = Lock()
+        self._zoom_job: Optional[Dict[str, Any]] = None
+        self._zoom_gen = 0
+        self._zoom_shown: Optional[tuple[int, int, int, int]] = None
+        self._zoom_status: Dict[str, Any] = {"status": "idle", "attempts": 0}
+        sinkpad = capsfilter.get_static_pad("sink")
+        if sinkpad is not None and camerasrc.find_property("scaler-crop") is not None:
+            sinkpad.add_probe(Gst.PadProbeType.BUFFER, self._zoom_probe, camerasrc)
         return elements
-
 
     # --- Runtime zoom (libcamerasrc `scaler-crop`) -------------------------
 
@@ -981,6 +1013,7 @@ class GstMediaServer:
                 round((rect[1] + rect[3] / 2 - my) / mh, 4),
             ],
             "sensor_mode": os.environ.get("REACHY_CAMERA_SENSOR_MODE") or "auto",
+            **dict(getattr(self, "_zoom_status", {}) or {}),
         }
 
     def set_zoom(
@@ -996,14 +1029,217 @@ class GstMediaServer:
         src = getattr(self, "_camerasrc", None)
         if src is None or src.find_property("scaler-crop") is None:
             raise RuntimeError("Runtime zoom needs a libcamerasrc with scaler-crop.")
+        mx, my, mw, mh = self._crop_maximum()
         factor = max(1.0, float(factor))
-        rect, _nudged = zoom_verify.compute_zoom_rect(
-            self._crop_maximum(), factor, center
+        # ``nudged`` is a retry copy (see _ZOOM_NUDGE): libcamera skips a crop
+        # equal to the last one it programmed, so a retry has to differ.
+        rect, nudged = zoom_verify.compute_zoom_rect(
+            (mx, my, mw, mh), factor, center, nudge=_ZOOM_NUDGE
         )
-        Gst.util_set_object_arg(src, "scaler-crop", "<{}, {}, {}, {}>".format(*rect))
+        # Hand the crop to the streaming thread; _zoom_probe sets and verifies it.
+        with self._zoom_lock:
+            shown = self._zoom_shown or (mx, my, mw, mh)
+            olds = [shown]
+            prev = self._zoom_job
+            if prev is not None and prev["rect"] != shown:
+                olds.append(prev["rect"])  # the previous change may have landed
+            self._zoom_gen += 1
+            trivial = prev is None and zoom_verify.rects_close(shown, rect)
+            self._zoom_job = {
+                "gen": self._zoom_gen,
+                "rect": rect,
+                "rects": (rect, nudged),
+                "olds": olds,
+                "attempt": 1,
+                "left": _ZOOM_REASSERT_BUFFERS,
+                "k": 0,
+                "wait": 0,
+                "ref": None,
+                "verify": not trivial,
+            }
+            if trivial:
+                self._zoom_shown = rect
+            self._zoom_status = {
+                "status": "applied" if trivial else "pending",
+                "attempts": 1,
+            }
         self._zoom_rect = None if factor == 1.0 else rect
         self._logger.info(f"Camera zoom: factor={factor:.3f} rect={rect}")
         return self.get_zoom()
+
+    def _zoom_probe(
+        self, pad: Gst.Pad, info: Gst.PadProbeInfo, src: Gst.Element
+    ) -> Gst.PadProbeReturn:
+        """Apply, verify and if needed re-apply a requested crop.
+
+        Runs in libcamerasrc's streaming thread. libcamerasrc (0.7.x) moves
+        pending controls into the next request and clears them before it
+        knows whether the request can be queued, so a crop is lost whenever
+        that request is dropped for lack of buffers (-ENOBUFS). Its control
+        list also has no lock shared with set_property, so setting the
+        property from another thread races the streaming thread. Setting it
+        here on every buffer of a ~1.5 s window avoids both.
+
+        Even so, a crop occasionally never shows up, and re-sending the same
+        rectangle cannot help: libcamera's Raspberry Pi pipeline only
+        re-programs the ISP when the crop differs from the last one it set.
+        So each change is checked from a tiny luma thumbnail of a frame
+        before and after it (zoom_verify), and if it did not take, a nudged
+        copy of the crop is re-applied, with backoff, up to
+        _ZOOM_MAX_ATTEMPTS windows.
+        """
+        with self._zoom_lock:
+            job = self._zoom_job
+            if job is None:
+                return Gst.PadProbeReturn.OK
+            if job["wait"] > 0:
+                job["wait"] -= 1
+                return Gst.PadProbeReturn.OK
+            gen = job["gen"]
+            k = job["k"]
+            job["k"] = k + 1
+            need_ref = job["verify"] and job["ref"] is None
+            rect = job["rects"][(job["attempt"] - 1) % 2]
+            do_set = job["left"] > 0
+            if do_set:
+                job["left"] -= 1
+            do_check = job["verify"] and not need_ref and k in _ZOOM_CHECK_AT
+            if not job["verify"] and job["left"] == 0:
+                self._zoom_job = None
+        if do_set:
+            Gst.util_set_object_arg(src, "scaler-crop", "<{}, {}, {}, {}>".format(*rect))
+        if not (need_ref or do_check):
+            return Gst.PadProbeReturn.OK
+        thumb = self._zoom_thumbnail(pad, info)
+        with self._zoom_lock:
+            job = self._zoom_job
+            if job is None or job["gen"] != gen:
+                return Gst.PadProbeReturn.OK
+            if need_ref:
+                if thumb is None:
+                    job["verify"] = False  # cannot check this format
+                    self._zoom_status = {"status": "unverified", "attempts": 1}
+                else:
+                    job["ref"] = thumb
+                return Gst.PadProbeReturn.OK
+            verdict, s_app, s_id = (
+                zoom_verify.check(job["ref"], thumb, job["olds"], rect)
+                if thumb is not None
+                else (zoom_verify.UNCERTAIN, None, None)
+            )
+            last = k == _ZOOM_CHECK_AT[-1]
+            seen = job.get("seen", False)
+            reverted = seen and verdict == zoom_verify.NOT_APPLIED
+            retry = False
+            status = None
+            keyframe = False
+            if verdict == zoom_verify.APPLIED:
+                keyframe = not seen or last
+                job["seen"] = True
+                job["left"] = 0  # visible: stop re-asserting, keep checking
+                if last:
+                    status = "applied"
+            elif last and verdict == zoom_verify.UNCERTAIN:
+                status = "applied" if seen else "unverified"
+            elif (last or reverted) and job["attempt"] >= _ZOOM_MAX_ATTEMPTS:
+                status = "failed"
+            elif last or reverted:
+                retry = True
+            if retry:
+                job["seen"] = False
+                job["attempt"] += 1
+                job["left"] = _ZOOM_REASSERT_BUFFERS
+                job["k"] = 0
+                job["wait"] = 4 * 2 ** (job["attempt"] - 1)
+                if os.environ.get("REACHY_ZOOM_RETRY_NUDGE", "1") == "0":
+                    job["rects"] = (job["rect"], job["rect"])
+            scores = {
+                "score_applied": None if s_app is None else round(s_app, 3),
+                "score_unchanged": None if s_id is None else round(s_id, 3),
+            }
+            self._zoom_status = {
+                "status": status or "pending",
+                "attempts": job["attempt"],
+                **scores,
+            }
+            if status is not None:
+                self._zoom_job = None
+                if status != "failed":
+                    self._zoom_shown = job["rect"]
+                attempt = job["attempt"]
+        if keyframe:
+            self._request_keyframes()
+        if status == "failed":
+            self._logger.warning(f"Camera zoom did not take effect: {rect}")
+        elif status is not None:
+            self._logger.info(
+                f"Camera zoom {status}: {rect} attempt={attempt} buffer={k} {scores}"
+            )
+        elif retry:
+            self._logger.info(
+                f"Camera zoom {'reverted' if reverted else 'not visible'} at buffer {k}, "
+                f"retrying: {rect} {scores}"
+            )
+        return Gst.PadProbeReturn.OK
+
+    def _request_keyframes(self) -> None:
+        """Ask every WebRTC video encoder for a keyframe (off the camera thread).
+
+        A zoom change moves every pixel, so the frame carrying it is large
+        and, over Wi-Fi, the one most likely to lose packets. A client that
+        loses it keeps decoding on a broken reference (old crop, block
+        artifacts) until the next keyframe, which looks exactly like a zoom
+        that never happened. A fresh keyframe right after the change lands
+        avoids that.
+        """
+        encoders = [
+            e for e in getattr(self, "_video_encoders", []) if e.get_parent() is not None
+        ]
+        self._video_encoders = encoders
+        if not encoders:
+            return
+
+        def _send() -> None:
+            for enc in encoders:
+                try:
+                    # Upstream event into the encoder's src pad, where
+                    # GstVideoEncoder handles GstForceKeyUnit.
+                    srcpad = enc.get_static_pad("src")
+                    if srcpad is None:
+                        continue
+                    ok = srcpad.send_event(
+                        Gst.Event.new_custom(
+                            Gst.EventType.CUSTOM_UPSTREAM,
+                            Gst.Structure.new_from_string(
+                                "GstForceKeyUnit, all-headers=(boolean)true"
+                            ),
+                        )
+                    )
+                    self._logger.debug(f"keyframe requested: {enc.get_name()} {ok}")
+                except Exception as e:
+                    self._logger.debug(f"keyframe request failed: {e}")
+
+        Thread(target=_send, name="zoom-keyframe", daemon=True).start()
+
+    def _zoom_thumbnail(self, pad: Gst.Pad, info: Gst.PadProbeInfo) -> Optional[Any]:
+        """Small luma thumbnail of the probed buffer (YUY2 only), or None."""
+        try:
+            caps = pad.get_current_caps()
+            st = caps.get_structure(0) if caps is not None else None
+            if st is None or st.get_value("format") != "YUY2":
+                return None
+            width, height = st.get_value("width"), st.get_value("height")
+            buf = info.get_buffer()
+            ok, mapinfo = buf.map(Gst.MapFlags.READ)
+            if not ok:
+                return None
+            try:
+                return zoom_verify.thumbnail_yuy2(mapinfo.data, width, height)
+            finally:
+                buf.unmap(mapinfo)
+        except Exception as e:
+            self._logger.debug(f"zoom thumbnail failed: {e}")
+            return None
 
     def reset_zoom(self) -> Dict[str, Any]:
         """Return to the full field of view."""
