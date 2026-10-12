@@ -26,10 +26,11 @@ import logging
 import warnings
 from collections.abc import Callable
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import numpy as np
 import numpy.typing as npt
+import requests
 
 from reachy_mini.media.camera_constants import CameraSpecs
 from reachy_mini.motion.head_wobbler import SpeechOffsets
@@ -260,6 +261,30 @@ class MediaManager:
             self.logger.warning("Camera is not initialized.")
             return None
         return self.camera.read_jpeg()
+
+    def set_zoom(
+        self, factor: float = 1.0, center: tuple[float, float] = (0.5, 0.5)
+    ) -> dict[str, Any]:
+        """Zoom the robot camera via the daemon (POST /api/camera/zoom).
+
+        Args:
+            factor: Zoom factor >= 1.0 (1.0 = full field of view).
+            center: Crop centre in normalized (0..1) image coordinates.
+
+        """
+        url = self._daemon_url or getattr(self.camera, "daemon_url", "")
+        url = url or "http://localhost:8000"
+        resp = requests.post(
+            f"{url}/api/camera/zoom",
+            json={"factor": factor, "center": list(center)},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        return cast(dict[str, Any], resp.json())
+
+    def reset_zoom(self) -> dict[str, Any]:
+        """Reset the robot camera to its full field of view."""
+        return self.set_zoom(1.0)
 
     def play_sound(self, sound_file: str) -> None:
         """Play a sound file.
