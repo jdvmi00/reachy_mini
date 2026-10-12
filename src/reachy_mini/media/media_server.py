@@ -39,6 +39,7 @@ from reachy_mini.daemon.utils import (
     SimulationMode,
     is_local_camera_available,
 )
+from reachy_mini.media import zoom_verify
 from reachy_mini.media.audio_base import (
     AEC_CHANNELS,
     AEC_PROBE_NAME,
@@ -921,6 +922,8 @@ class GstMediaServer:
     def _build_libcamera_source(self) -> list[Gst.Element]:
         """Build source chain for RPi CSI camera (libcamerasrc)."""
         camerasrc = Gst.ElementFactory.make("libcamerasrc")
+        self._camerasrc = camerasrc
+        self._zoom_rect: Optional[tuple[int, int, int, int]] = None
         caps = Gst.Caps.from_string(
             f"video/x-raw,width={self.resolution[0]},height={self.resolution[1]},"
             f"framerate={self.framerate}/1,format=YUY2,"
@@ -933,6 +936,59 @@ class GstMediaServer:
         if not all(elements):
             raise RuntimeError("Failed to create libcamerasrc elements")
         return elements
+
+
+    # --- Runtime zoom (libcamerasrc `scaler-crop`) -------------------------
+
+    def _crop_maximum(self) -> tuple[int, int, int, int]:
+        """Return the full-FOV ScalerCrop rectangle.
+
+        Native sensor pixels, relative to the active area. Override with
+        ``REACHY_CAMERA_CROP_MAX="x,y,w,h"``. The default is the centre
+        3072x1728 crop of an imx708 (the 1536x864 sensor mode).
+        """
+        return zoom_verify.crop_maximum()
+
+    def get_zoom(self) -> Dict[str, Any]:
+        """Return the current zoom state."""
+        mx, my, mw, mh = self._crop_maximum()
+        rect = getattr(self, "_zoom_rect", None) or (mx, my, mw, mh)
+        return {
+            "rect": list(rect),
+            "crop_max": [mx, my, mw, mh],
+            "factor": round(mw / rect[2], 3),
+            "center": [
+                round((rect[0] + rect[2] / 2 - mx) / mw, 4),
+                round((rect[1] + rect[3] / 2 - my) / mh, 4),
+            ],
+            "sensor_mode": os.environ.get("REACHY_CAMERA_SENSOR_MODE") or "auto",
+        }
+
+    def set_zoom(
+        self, factor: float = 1.0, center: tuple[float, float] = (0.5, 0.5)
+    ) -> Dict[str, Any]:
+        """Crop the camera image at runtime (no pipeline restart).
+
+        Args:
+            factor: Zoom factor >= 1.0 relative to the full crop maximum.
+            center: Crop centre in normalized (0..1) coordinates of the full FOV.
+
+        """
+        src = getattr(self, "_camerasrc", None)
+        if src is None or src.find_property("scaler-crop") is None:
+            raise RuntimeError("Runtime zoom needs a libcamerasrc with scaler-crop.")
+        factor = max(1.0, float(factor))
+        rect, _nudged = zoom_verify.compute_zoom_rect(
+            self._crop_maximum(), factor, center
+        )
+        Gst.util_set_object_arg(src, "scaler-crop", "<{}, {}, {}, {}>".format(*rect))
+        self._zoom_rect = None if factor == 1.0 else rect
+        self._logger.info(f"Camera zoom: factor={factor:.3f} rect={rect}")
+        return self.get_zoom()
+
+    def reset_zoom(self) -> Dict[str, Any]:
+        """Return to the full field of view."""
+        return self.set_zoom(1.0)
 
     def _build_v4l2_source(self, device_path: str) -> list[Gst.Element]:
         """Build source chain for Linux V4L2 USB camera.

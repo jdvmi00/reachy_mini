@@ -5,7 +5,9 @@ Exposes camera specifications detected by the daemon so that clients
 coefficients, and available resolutions without hardcoding them.
 """
 
-from fastapi import APIRouter, Depends
+from typing import Any, cast
+
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from reachy_mini.media.camera_constants import get_camera_specs_by_name
@@ -68,3 +70,46 @@ async def get_camera_specs(
         K=specs.K.tolist(),
         D=specs.D.tolist(),
     )
+
+
+class ZoomRequest(BaseModel):
+    """Zoom request: factor >= 1 and crop centre in normalized FOV coords."""
+
+    factor: float = 1.0
+    center: tuple[float, float] = (0.5, 0.5)
+
+
+def _media_server(daemon: Daemon) -> Any:
+    """Return the live media server, or 503 when media is released."""
+    ms = getattr(daemon, "_media_server", None)
+    if ms is None or getattr(daemon, "_media_released", False):
+        raise HTTPException(status_code=503, detail="Media server not available.")
+    return ms
+
+
+def _zoom_state(value: Any) -> dict[str, Any]:
+    """Narrow a media-server zoom dict for the response."""
+    return cast(dict[str, Any], value)
+
+
+@router.get("/zoom")
+async def get_zoom(daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
+    """Get the current camera zoom (scaler-crop) state."""
+    return _zoom_state(_media_server(daemon).get_zoom())
+
+
+@router.post("/zoom")
+async def set_zoom(
+    req: ZoomRequest, daemon: Daemon = Depends(get_daemon)
+) -> dict[str, Any]:
+    """Zoom the camera stream at runtime (applies to every consumer)."""
+    try:
+        return _zoom_state(_media_server(daemon).set_zoom(req.factor, req.center))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+
+@router.post("/zoom/reset")
+async def reset_zoom(daemon: Daemon = Depends(get_daemon)) -> dict[str, Any]:
+    """Reset the camera to the full field of view."""
+    return _zoom_state(_media_server(daemon).reset_zoom())
