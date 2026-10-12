@@ -624,6 +624,87 @@
         }
       }
     },
+    "/api/camera/zoom": {
+      "get": {
+        "summary": "Get Zoom",
+        "description": "Get the current camera zoom (scaler-crop) state.",
+        "operationId": "get_zoom_api_camera_zoom_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Zoom Api Camera Zoom Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Set Zoom",
+        "description": "Zoom the camera stream at runtime (applies to every consumer).",
+        "operationId": "set_zoom_api_camera_zoom_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ZoomRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Set Zoom Api Camera Zoom Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/camera/zoom/reset": {
+      "post": {
+        "summary": "Reset Zoom",
+        "description": "Reset the camera to the full field of view.",
+        "operationId": "reset_zoom_api_camera_zoom_reset_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Reset Zoom Api Camera Zoom Reset Post"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/daemon/start": {
       "post": {
         "summary": "Start Daemon",
@@ -4158,6 +4239,36 @@
         "type": "object",
         "title": "XYZRPYPose",
         "description": "Represent a 3D pose using position (x, y, z) in meters and orientation (roll, pitch, yaw) angles in radians."
+      },
+      "ZoomRequest": {
+        "properties": {
+          "factor": {
+            "type": "number",
+            "title": "Factor",
+            "default": 1.0
+          },
+          "center": {
+            "prefixItems": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "type": "array",
+            "maxItems": 2,
+            "minItems": 2,
+            "title": "Center",
+            "default": [
+              0.5,
+              0.5
+            ]
+          }
+        },
+        "type": "object",
+        "title": "ZoomRequest",
+        "description": "Zoom request: factor >= 1 and crop centre in normalized FOV coords."
       }
     }
   }
