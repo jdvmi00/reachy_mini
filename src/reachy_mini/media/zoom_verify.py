@@ -8,16 +8,20 @@ Rect = tuple[int, int, int, int]
 
 
 def crop_maximum() -> Rect:
-    """Return the full-FOV ScalerCrop rectangle.
+    """Return the full-FOV ScalerCrop rectangle for the active sensor mode.
 
     Native sensor pixels, relative to the active area. Override with
-    ``REACHY_CAMERA_CROP_MAX="x,y,w,h"``. The default is the centre
-    3072x1728 crop of an imx708 (the 1536x864 sensor mode).
+    ``REACHY_CAMERA_CROP_MAX="x,y,w,h"``. Defaults assume an imx708
+    (4608x2592 active area): full FOV for the 2304x1296 and 4608x2592
+    modes, the centre 3072x1728 for the default 1536x864 mode.
     """
     env = os.environ.get("REACHY_CAMERA_CROP_MAX", "").strip()
     if env:
         x, y, w, h = (int(v) for v in env.split(","))
         return (x, y, w, h)
+    mode = os.environ.get("REACHY_CAMERA_SENSOR_MODE", "").strip().lower()
+    if mode in ("2304x1296", "4608x2592"):
+        return (0, 0, 4608, 2592)
     return (768, 432, 3072, 1728)
 
 
