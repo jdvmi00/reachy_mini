@@ -46,6 +46,29 @@ with ReachyMini(media_backend="default") as mini:
 ```
 The returned frame is a numpy array with shape `(height, width, 3)` and data type `uint8`.
 
+### Camera zoom
+
+On Wireless (imx708), the daemon can crop the sensor at runtime. The stream stays 1280×720, and every consumer — on-robot apps and WebRTC viewers — sees the same crop.
+
+```python
+with ReachyMini() as mini:
+    state = mini.media.set_zoom(factor=1.8, center=(0.5, 0.5))
+    frame = mini.media.get_frame()
+    mini.media.reset_zoom()
+```
+
+`factor` is at least 1.0, relative to the active sensor mode (`1.0` is the full field of view). `center` is `(x, y)` in normalized coordinates of that field of view, each from 0 to 1. The same controls are on the daemon:
+
+| Method | Path | Body |
+| --- | --- | --- |
+| `GET` | `/api/camera/zoom` | — |
+| `POST` | `/api/camera/zoom` | `{"factor": 1.8, "center": [0.5, 0.5]}` |
+| `POST` | `/api/camera/zoom/reset` | — |
+
+Responses include `rect` (`[x, y, w, h]` in sensor pixels), `factor`, `center`, `crop_max`, `sensor_mode`, and `status` (`pending`, `applied`, `unverified`, or `failed`).
+
+The default 720p pipeline selects the centre-cropped 1536×864 mode, which has little real detail past about 1.2×. Start the daemon with `REACHY_CAMERA_SENSOR_MODE=2304x1296` to request the full-FOV binned mode (about 1.8× of real detail at 720p30). `4608x2592` requests the full-resolution mode. libcamerasrc ignores the variable when it has no `sensor-config` property.
+
 ### Head Tracking 👀
 
 The daemon can track the closest face and turn the head to follow it (aiming at the nose). Detection runs inside the daemon.
