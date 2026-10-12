@@ -924,6 +924,24 @@ class GstMediaServer:
         camerasrc = Gst.ElementFactory.make("libcamerasrc")
         self._camerasrc = camerasrc
         self._zoom_rect: Optional[tuple[int, int, int, int]] = None
+        # Optional sensor mode (e.g. "2304x1296" for full FOV) via the
+        # libcamerasrc `sensor-config` property (libcamera >= 0.7.1). Must be
+        # set before the pipeline leaves READY.
+        mode = os.environ.get("REACHY_CAMERA_SENSOR_MODE", "").strip()
+        if mode and camerasrc is not None:
+            if camerasrc.find_property("sensor-config") is None:
+                self._logger.warning(
+                    "libcamerasrc has no sensor-config; ignoring "
+                    f"REACHY_CAMERA_SENSOR_MODE={mode}"
+                )
+            else:
+                w, h = (int(v) for v in mode.lower().split("x"))
+                Gst.util_set_object_arg(
+                    camerasrc,
+                    "sensor-config",
+                    f"sensor/config,width={w},height={h},depth=10",
+                )
+                self._logger.info(f"Camera sensor mode requested: {w}x{h}")
         caps = Gst.Caps.from_string(
             f"video/x-raw,width={self.resolution[0]},height={self.resolution[1]},"
             f"framerate={self.framerate}/1,format=YUY2,"
@@ -941,11 +959,12 @@ class GstMediaServer:
     # --- Runtime zoom (libcamerasrc `scaler-crop`) -------------------------
 
     def _crop_maximum(self) -> tuple[int, int, int, int]:
-        """Return the full-FOV ScalerCrop rectangle.
+        """Return the full-FOV ScalerCrop rectangle for the active sensor mode.
 
         Native sensor pixels, relative to the active area. Override with
-        ``REACHY_CAMERA_CROP_MAX="x,y,w,h"``. The default is the centre
-        3072x1728 crop of an imx708 (the 1536x864 sensor mode).
+        ``REACHY_CAMERA_CROP_MAX="x,y,w,h"``. Defaults assume an imx708
+        (4608x2592 active area): full FOV for the 2304x1296 and 4608x2592
+        modes, the centre 3072x1728 for the default 1536x864 mode.
         """
         return zoom_verify.crop_maximum()
 
