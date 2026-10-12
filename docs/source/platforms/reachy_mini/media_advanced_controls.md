@@ -50,6 +50,26 @@ def _configure_video(
     # camerasrc.set_property("lens-position", 1000)
 ```
 
+### Runtime zoom
+
+The daemon crops the imx708 at runtime through libcamerasrc `scaler-crop`. Output resolution stays 1280×720, and the pipeline keeps running. From Python, call `mini.media.set_zoom(factor, center)` and `mini.media.reset_zoom()` (see [Camera zoom](../../SDK/python-sdk.md)). The HTTP API is:
+
+```bash
+curl -s http://reachy-mini.local:8000/api/camera/zoom
+curl -s -X POST http://reachy-mini.local:8000/api/camera/zoom \
+    -H 'Content-Type: application/json' \
+    -d '{"factor": 1.8, "center": [0.5, 0.5]}'
+curl -s -X POST http://reachy-mini.local:8000/api/camera/zoom/reset
+```
+
+The 720p stream otherwise selects the centre-cropped 1536×864 mode. Set this before the daemon starts to request the full field of view (binned, up to 56 fps; the stream stays 30 fps):
+
+```bash
+export REACHY_CAMERA_SENSOR_MODE=2304x1296
+```
+
+`4608x2592` requests the full-resolution mode. The variable is applied only when libcamerasrc exposes `sensor-config`. `REACHY_CAMERA_CROP_MAX=x,y,w,h` overrides the sensor rectangle treated as the full frame (native pixels, relative to the active area).
+
 
 ## Microphones and Speakers
 
